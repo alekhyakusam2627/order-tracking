@@ -47,7 +47,11 @@ async def _image_data_url(url: str) -> str:
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         response = await client.get(url, auth=auth)
         response.raise_for_status()
+    if len(response.content) > get_settings().max_request_bytes:
+        raise ValueError("Image is too large")
     content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
+    if not content_type.startswith("image/"):
+        raise ValueError("Unsupported media type")
     encoded = base64.b64encode(response.content).decode("ascii")
     return f"data:{content_type};base64,{encoded}"
 

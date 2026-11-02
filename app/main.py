@@ -1,16 +1,32 @@
 import asyncio
+import logging
+import secrets
+import time
 from contextlib import asynccontextmanager, suppress
 from html import escape
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from twilio.request_validator import RequestValidator
 
 from .config import get_settings
-from .database import attach_aftership, init_db, list_shipments, save_shipment, update_status
+from .database import attach_aftership, database_ready, init_db, list_shipments, save_shipment, update_status
 from .integrations import register_tracking, send_whatsapp, valid_aftership_signature
 from .parser import parse_message
 from .poller import poll_twilio_messages
+
+
+settings = get_settings()
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+security = HTTPBasic(auto_error=False)
+REQUESTS = Counter("forwarding_bot_http_requests_total", "HTTP requests", ["method", "path", "status"])
+LATENCY = Histogram("forwarding_bot_http_request_seconds", "HTTP request latency", ["method", "path"])
 
 
 @asynccontextmanager
@@ -27,7 +43,45 @@ async def lifespan(_: FastAPI):
             await poller
 
 
-app = FastAPI(title="Forwarding Bot", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Forwarding Bot",
+    version="2.0.0",
+    docs_url=None if settings.production else "/docs",
+    redoc_url=None if settings.production else "/redoc",
+    lifespan=lifespan,
+)
+
+
+@app.middleware("http")
+async def security_and_metrics(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.max_request_bytes:
+        return Response("Request too large", status_code=413)
+    started = time.perf_counter()
+    response = await call_next(request)
+    path = request.scope.get("route").path if request.scope.get("route") else "unmatched"
+    REQUESTS.labels(request.method, path, str(response.status_code)).inc()
+    LATENCY.labels(request.method, path).observe(time.perf_counter() - started)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def require_dashboard_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
+    if not settings.enable_dashboard:
+        raise HTTPException(status_code=404, detail="Dashboard disabled")
+    if not settings.dashboard_password:
+        raise HTTPException(status_code=503, detail="Dashboard credentials are not configured")
+    valid = bool(credentials) and secrets.compare_digest(credentials.username, settings.dashboard_username)
+    valid = valid and secrets.compare_digest(credentials.password, settings.dashboard_password)
+    if not valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
 
 def twiml(message: str) -> Response:
@@ -52,6 +106,22 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/ready")
+def ready():
+    if not database_ready():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"status": "ready"}
+
+
+@app.get("/metrics")
+def metrics(request: Request):
+    if settings.metrics_token:
+        supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not secrets.compare_digest(supplied, settings.metrics_token):
+            raise HTTPException(status_code=401, detail="Authentication required")
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/webhooks/whatsapp")
 async def whatsapp_webhook(request: Request):
     form = dict(await request.form())
@@ -72,6 +142,7 @@ async def whatsapp_webhook(request: Request):
         attach_aftership(shipment_id, aftership_id, status)
         return twiml(f"Got it! I'm tracking {label} with {carrier}: {info.tracking_number}.")
     except Exception:
+        logger.exception("Failed to process WhatsApp webhook")
         return twiml("I couldn't process that shipment right now. Please try again shortly.")
 
 
@@ -97,17 +168,13 @@ async def aftership_webhook(request: Request, background_tasks: BackgroundTasks)
     return {"accepted": True, "updated": bool(shipment)}
 
 
-@app.get("/api/shipments")
+@app.get("/api/shipments", dependencies=[Depends(require_dashboard_auth)])
 def shipments(phone: str | None = None):
-    if not get_settings().enable_dashboard:
-        raise HTTPException(status_code=404, detail="Dashboard disabled")
     return {"shipments": list_shipments(phone)}
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_dashboard_auth)])
 def dashboard():
-    if not get_settings().enable_dashboard:
-        raise HTTPException(status_code=404, detail="Dashboard disabled")
     return HTMLResponse("""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>
 <title>Package Tracker</title><style>body{font:15px system-ui;margin:0;background:#f5f6fa;color:#172033}main{max-width:1050px;margin:48px auto;padding:0 20px}h1{font-size:32px}.card{background:white;border-radius:16px;box-shadow:0 8px 30px #17203312;overflow:hidden}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:15px;border-bottom:1px solid #edf0f5}th{background:#fafbfc;color:#687386}.status{display:inline-block;padding:5px 9px;border-radius:99px;background:#e8f1ff;color:#1262c5}@media(max-width:700px){th:nth-child(4),td:nth-child(4){display:none}}</style></head>
 <body><main><h1>Your deliveries</h1><p>Forward a shipping message or screenshot to the WhatsApp bot. New deliveries appear here automatically.</p><div class='card'><table><thead><tr><th>Item</th><th>Carrier</th><th>Tracking</th><th>Customer</th><th>Status</th></tr></thead><tbody id='rows'></tbody></table></div></main>

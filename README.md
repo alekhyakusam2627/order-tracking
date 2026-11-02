@@ -1,35 +1,107 @@
-# WhatsApp Forwarding Bot
+# Order Tracking Bot
 
-Forward a shipment message or screenshot to a Twilio WhatsApp number. The service extracts tracking details with OpenAI, registers the shipment with AfterShip, stores it in SQLite, shows it on a dashboard, and sends WhatsApp status updates.
+A production-oriented WhatsApp package tracker. Customers forward shipping text or screenshots; the service extracts carrier details, registers the shipment, persists its state, and sends delivery updates.
 
-## Run locally
+## Architecture
+
+- **Ingress:** signed Twilio WhatsApp webhooks
+- **Parsing:** deterministic carrier patterns first, OpenAI structured vision/text extraction as fallback
+- **Tracking:** AfterShip Tracking API and signed update webhooks
+- **Persistence:** PostgreSQL in production; SQLite for local development
+- **Operations:** readiness/health checks, Prometheus metrics, structured logs, migrations, Docker, and CI
+- **Dashboard:** disabled by default and protected with HTTP Basic authentication when enabled
+
+## Local development
 
 ```bash
-cd forwarding-bot
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env.local
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-The service reads the workspace-level `.env.local` created during secure API setup. Copy the remaining names from `.env.example` into that file and add your Twilio and AfterShip credentials.
+Set the required values in `.env.local`. Never commit that file.
 
-## Connect the services
+```bash
+pytest -q
+```
 
-1. Expose the local server with a secure HTTPS tunnel or deploy it.
-2. Set `PUBLIC_BASE_URL` to that public origin (no trailing slash).
-3. In the Twilio WhatsApp sender or Sandbox, set **A message comes in** to `POST https://your-domain/webhooks/whatsapp`.
-4. In AfterShip, create a webhook pointing to `POST https://your-domain/webhooks/aftership` and set the same secret in `AFTERSHIP_WEBHOOK_SECRET`.
-5. Set `ENABLE_DASHBOARD=true` only on a private or authenticated deployment, then open `/` for the delivery dashboard. `/health` remains available for health checks.
+Local endpoints:
 
-If `AFTERSHIP_API_KEY` is omitted, parsed shipments are still saved with a pending-registration status, which is useful for local testing.
+- `GET /health` — process liveness
+- `GET /ready` — database readiness
+- `GET /metrics` — Prometheus metrics
+- `POST /webhooks/whatsapp` — signed Twilio ingress
+- `POST /webhooks/aftership` — signed AfterShip updates
+- `GET /` and `/api/shipments` — authenticated dashboard when enabled
 
-For Twilio's newer trial console, which may not expose a custom inbound webhook, set
-`TWILIO_POLLING_ENABLED=true`. The service then consumes received WhatsApp messages from
-Twilio's API every few seconds and sends the same replies without requiring a public webhook.
+## Production deployment
 
-## Production notes
+The included Docker image runs migrations before starting Gunicorn. Use a managed PostgreSQL database and configure these variables in the deployment platform:
 
-- The dashboard is disabled by default. Put it behind authentication before enabling it on a public deployment.
-- Use Postgres instead of SQLite when running multiple server instances.
-- Keep `.env.local` out of source control and rotate any credential that is accidentally exposed.
+```text
+APP_ENV=production
+DATABASE_URL=postgresql+psycopg://...
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-4.1-mini
+PUBLIC_BASE_URL=https://your-production-domain
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_WHATSAPP_NUMBER=whatsapp:+...
+AFTERSHIP_API_KEY=...
+AFTERSHIP_WEBHOOK_SECRET=...
+ENABLE_DASHBOARD=true
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=<long-random-password>
+METRICS_TOKEN=<long-random-token>
+TWILIO_POLLING_ENABLED=false
+```
+
+Production startup fails fast when required settings are missing. If AfterShip is enabled, its webhook secret is mandatory. Polling mode is intentionally rejected in production because multiple replicas would process the same Twilio feed; use signed webhooks instead.
+
+### Twilio
+
+Configure the production WhatsApp sender's incoming message URL as:
+
+```text
+POST https://your-production-domain/webhooks/whatsapp
+```
+
+The service validates every `X-Twilio-Signature`. Use a registered WhatsApp sender for production; Twilio's trial testing environment restricts custom replies.
+
+### AfterShip
+
+Configure the tracking webhook as:
+
+```text
+POST https://your-production-domain/webhooks/aftership
+```
+
+Set the matching webhook secret in `AFTERSHIP_WEBHOOK_SECRET`. Incoming signatures are compared using constant-time HMAC validation.
+
+## Deployment options
+
+- `railway.toml` configures a Railway Docker deployment and `/ready` health check.
+- `docker-compose.yml` provides an app/PostgreSQL stack for a controlled server.
+- `.github/workflows/ci.yml` runs tests and builds the image on pushes and pull requests.
+
+## Operational checklist
+
+- Use managed PostgreSQL with automated backups and point-in-time recovery.
+- Store all secrets in the hosting platform's encrypted variables.
+- Put `/metrics` behind the platform's private network or access control.
+- Set alerts for 5xx rate, webhook signature failures, queue latency, and database availability.
+- Rotate Twilio, OpenAI, AfterShip, and dashboard credentials regularly.
+- Configure at least two application replicas only after moving any background work to a dedicated worker.
+- Review carrier data retention and customer privacy requirements for every launch region.
+
+## Known account dependencies
+
+Code readiness does not activate paid third-party capabilities. A real launch still requires:
+
+1. A funded OpenAI API project for screenshot/ambiguous-message parsing.
+2. A production Twilio WhatsApp sender approved by Meta/Twilio.
+3. An AfterShip plan with Tracking API access, or an equivalent carrier aggregator.
+4. A production hosting account, domain, PostgreSQL database, monitoring, and backup policy.

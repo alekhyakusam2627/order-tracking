@@ -1,11 +1,15 @@
+import base64
 import hashlib
 import hmac
-import base64
+import logging
 
 import httpx
 
 from .config import get_settings
 from .schemas import TrackingInfo
+
+
+logger = logging.getLogger(__name__)
 
 
 async def register_tracking(info: TrackingInfo, user_phone: str) -> tuple[str, str]:
@@ -44,7 +48,7 @@ def valid_aftership_signature(body: bytes, signature: str | None) -> bool:
 async def send_whatsapp(to: str, message: str) -> None:
     settings = get_settings()
     if not all((settings.twilio_account_sid, settings.twilio_auth_token, settings.twilio_whatsapp_number)):
-        return
+        raise RuntimeError("Twilio outbound messaging is not configured")
     url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Messages.json"
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(

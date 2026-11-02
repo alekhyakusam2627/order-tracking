@@ -1,108 +1,138 @@
-import sqlite3
-from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+
+from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine, select, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import get_settings
 
 
-def _path() -> Path:
-    path = Path(get_settings().database_path)
+class Base(DeclarativeBase):
+    pass
+
+
+class ShipmentRecord(Base):
+    __tablename__ = "shipments"
+    __table_args__ = (UniqueConstraint("user_phone", "tracking_number"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_phone: Mapped[str] = mapped_column(String(64), index=True)
+    tracking_number: Mapped[str] = mapped_column(String(128), index=True)
+    carrier: Mapped[str] = mapped_column(String(64))
+    item_label: Mapped[str] = mapped_column(String(255), default="Online order")
+    status: Mapped[str] = mapped_column(String(128), default="Pending")
+    aftership_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class ProcessedMessage(Base):
+    __tablename__ = "processed_messages"
+    message_sid: Mapped[str] = mapped_column(String(128), primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+def _database_url() -> str:
+    settings = get_settings()
+    if settings.database_url:
+        return settings.database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    path = Path(settings.database_path)
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
     path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    return f"sqlite:///{path}"
 
 
-@contextmanager
-def connect():
-    conn = sqlite3.connect(_path())
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+engine = create_engine(_database_url(), pool_pre_ping=True)
+SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
 
 def init_db() -> None:
-    with connect() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS shipments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_phone TEXT NOT NULL,
-                tracking_number TEXT NOT NULL,
-                carrier TEXT NOT NULL,
-                item_label TEXT NOT NULL DEFAULT 'Online order',
-                status TEXT NOT NULL DEFAULT 'Pending',
-                aftership_id TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_phone, tracking_number)
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS processed_messages (
-                message_sid TEXT PRIMARY KEY,
-                processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+    Base.metadata.create_all(engine)
+
+
+def database_ready() -> bool:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
 
 
 def message_processed(message_sid: str) -> bool:
-    with connect() as db:
-        return db.execute(
-            "SELECT 1 FROM processed_messages WHERE message_sid=?", (message_sid,)
-        ).fetchone() is not None
+    with SessionLocal() as db:
+        return db.get(ProcessedMessage, message_sid) is not None
 
 
 def mark_message_processed(message_sid: str) -> None:
-    with connect() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO processed_messages (message_sid) VALUES (?)", (message_sid,)
-        )
+    with SessionLocal.begin() as db:
+        if db.get(ProcessedMessage, message_sid) is None:
+            db.add(ProcessedMessage(message_sid=message_sid))
 
 
 def save_shipment(user_phone: str, tracking_number: str, carrier: str, item_label: str) -> int:
-    with connect() as db:
-        db.execute("""
-            INSERT INTO shipments (user_phone, tracking_number, carrier, item_label)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_phone, tracking_number) DO UPDATE SET
-              carrier=excluded.carrier, item_label=excluded.item_label, updated_at=CURRENT_TIMESTAMP
-        """, (user_phone, tracking_number, carrier, item_label))
-        row = db.execute(
-            "SELECT id FROM shipments WHERE user_phone=? AND tracking_number=?",
-            (user_phone, tracking_number),
-        ).fetchone()
-        return int(row["id"])
+    now = datetime.now(timezone.utc)
+    with SessionLocal.begin() as db:
+        record = db.scalar(select(ShipmentRecord).where(
+            ShipmentRecord.user_phone == user_phone,
+            ShipmentRecord.tracking_number == tracking_number,
+        ))
+        if record is None:
+            record = ShipmentRecord(
+                user_phone=user_phone,
+                tracking_number=tracking_number,
+                carrier=carrier,
+                item_label=item_label,
+            )
+            db.add(record)
+            db.flush()
+        else:
+            record.carrier = carrier
+            record.item_label = item_label
+            record.updated_at = now
+        return record.id
 
 
 def attach_aftership(shipment_id: int, aftership_id: str, status: str) -> None:
-    with connect() as db:
-        db.execute(
-            "UPDATE shipments SET aftership_id=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (aftership_id, status, shipment_id),
-        )
+    with SessionLocal.begin() as db:
+        record = db.get(ShipmentRecord, shipment_id)
+        if record:
+            record.aftership_id = aftership_id or None
+            record.status = status
+            record.updated_at = datetime.now(timezone.utc)
 
 
-def update_status(tracking_number: str, status: str) -> sqlite3.Row | None:
-    with connect() as db:
-        db.execute(
-            "UPDATE shipments SET status=?, updated_at=CURRENT_TIMESTAMP WHERE tracking_number=?",
-            (status, tracking_number),
-        )
-        return db.execute(
-            "SELECT * FROM shipments WHERE tracking_number=? ORDER BY id DESC LIMIT 1",
-            (tracking_number,),
-        ).fetchone()
+def update_status(tracking_number: str, status: str) -> dict | None:
+    with SessionLocal.begin() as db:
+        record = db.scalar(select(ShipmentRecord).where(
+            ShipmentRecord.tracking_number == tracking_number
+        ).order_by(ShipmentRecord.id.desc()))
+        if not record:
+            return None
+        record.status = status
+        record.updated_at = datetime.now(timezone.utc)
+        db.flush()
+        return _as_dict(record)
+
+
+def _as_dict(record: ShipmentRecord) -> dict:
+    return {
+        "id": record.id,
+        "user_phone": record.user_phone,
+        "tracking_number": record.tracking_number,
+        "carrier": record.carrier,
+        "item_label": record.item_label,
+        "status": record.status,
+        "aftership_id": record.aftership_id,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
 
 
 def list_shipments(phone: str | None = None) -> list[dict]:
-    with connect() as db:
+    with SessionLocal() as db:
+        query = select(ShipmentRecord).order_by(ShipmentRecord.updated_at.desc()).limit(250)
         if phone:
-            rows = db.execute(
-                "SELECT * FROM shipments WHERE user_phone=? ORDER BY updated_at DESC", (phone,)
-            ).fetchall()
-        else:
-            rows = db.execute("SELECT * FROM shipments ORDER BY updated_at DESC LIMIT 250").fetchall()
-        return [dict(row) for row in rows]
+            query = query.where(ShipmentRecord.user_phone == phone)
+        return [_as_dict(row) for row in db.scalars(query).all()]

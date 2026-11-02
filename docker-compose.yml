@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env.local
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://order_tracking:order_tracking@db:5432/order_tracking
+      PUBLIC_BASE_URL: http://localhost:8000
+      WEB_CONCURRENCY: "2"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: order_tracking
+      POSTGRES_USER: order_tracking
+      POSTGRES_PASSWORD: order_tracking
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U order_tracking"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
