@@ -12,19 +12,32 @@ SYSTEM_PROMPT = """You extract package tracking details from forwarded shopping 
 Return a carrier, tracking number, and short item label. Never treat an order number, phone number,
 price, or date as a tracking number. Preserve tracking-number letters and digits, removing spaces and
 decorative punctuation. If no credible tracking number exists, set tracking_number to null. Use a
-lowercase carrier slug when confident (for example usps, ups, fedex, dhl, bluedart)."""
+lowercase carrier slug when confident (for example usps, ups, fedex, dhl, canada-post,
+india-post, bluedart)."""
 
 
 def parse_tracking_text(text: str) -> TrackingInfo | None:
     compact = text.upper()
     patterns = (
         ("ups", r"\b1Z[0-9A-Z]{16}\b"),
+        ("canada-post", r"\b(?:\d{16}|[A-Z]{2}\d{9}CA)\b"),
         ("fedex", r"\b(?:\d{12}|\d{15}|\d{20}|\d{22})\b"),
         ("usps", r"\b(?:9[2345]\d{18,20}|[A-Z]{2}\d{9}US)\b"),
-        ("dhl", r"\b(?:\d{10}|[A-Z]{3}\d{7})\b"),
+        ("dhl", r"\b(?:\d{10}|\d{16}|[A-Z]{3}\d{7})\b"),
+        ("india-post", r"\b[A-Z]{2}\d{9}IN\b"),
     )
+    lowered = text.lower()
+    hints = {
+        "canada-post": ("canada post", "canadapost"),
+        "india-post": ("india post", "indiapost"),
+        "fedex": ("fedex",),
+        "ups": ("ups",),
+        "usps": ("usps",),
+        "dhl": ("dhl",),
+        "bluedart": ("bluedart", "blue dart"),
+    }
     carrier_hint = next(
-        (carrier for carrier in ("fedex", "ups", "usps", "dhl", "bluedart") if carrier in text.lower()),
+        (carrier for carrier, names in hints.items() if any(name in lowered for name in names)),
         None,
     )
     ordered = sorted(patterns, key=lambda item: item[0] != carrier_hint)

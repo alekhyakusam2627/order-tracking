@@ -13,3 +13,15 @@ def test_tracking_url_encodes_untrusted_number():
 
 def test_unknown_carrier_has_no_external_link():
     assert carrier_tracking_url("unknown", "123") is None
+
+
+def test_canada_post_tracking_url():
+    assert carrier_tracking_url("canada-post", "0106716248026353") == (
+        "https://www.canadapost-postescanada.ca/track-reperage/en/details/0106716248026353"
+    )
+
+
+def test_india_post_tracking_url():
+    assert carrier_tracking_url("india-post", "EM123456789IN") == (
+        "https://www.indiapost.gov.in/vas/Pages/trackconsignment.aspx"
+    )
