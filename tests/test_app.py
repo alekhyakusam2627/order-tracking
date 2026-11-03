@@ -5,6 +5,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ["DATABASE_PATH"] = tempfile.mktemp(suffix=".db")
 os.environ["DATABASE_URL"] = ""
 os.environ["TWILIO_POLLING_ENABLED"] = "false"
+os.environ["ENABLE_DASHBOARD"] = "false"
 
 from fastapi.testclient import TestClient
 
