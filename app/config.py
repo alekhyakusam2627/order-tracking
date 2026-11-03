@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     enable_dashboard: bool = False
     dashboard_username: str = "admin"
     dashboard_password: str = ""
+    customer_dashboard_secret: str = ""
     metrics_token: str = ""
     twilio_polling_enabled: bool = False
     twilio_poll_interval_seconds: int = 5
@@ -43,6 +44,8 @@ class Settings(BaseSettings):
                 missing.append(name.upper())
         if self.enable_dashboard and not self.dashboard_password:
             missing.append("DASHBOARD_PASSWORD")
+        if not self.customer_dashboard_secret:
+            missing.append("CUSTOMER_DASHBOARD_SECRET")
         if not self.metrics_token:
             missing.append("METRICS_TOKEN")
         if self.aftership_api_key and not self.aftership_webhook_secret:

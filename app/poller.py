@@ -4,6 +4,7 @@ import logging
 import httpx
 
 from .config import get_settings
+from .customer_access import customer_dashboard_url
 from .database import attach_aftership, mark_message_processed, message_processed, save_shipment
 from .integrations import register_tracking, send_whatsapp
 from .parser import parse_message
@@ -54,7 +55,9 @@ async def process_twilio_message(message: dict, client: httpx.AsyncClient) -> No
             attach_aftership(shipment_id, aftership_id, status)
             mark_message_processed(sid)
             await send_whatsapp(
-                sender, f"Got it! I'm tracking {label} with {carrier}: {info.tracking_number}."
+                sender,
+                f"Got it! I'm tracking {label} with {carrier}: {info.tracking_number}. "
+                f"Your private dashboard: {customer_dashboard_url(sender)}",
             )
     except Exception:
         logger.exception("Failed to process Twilio message %s", sid)

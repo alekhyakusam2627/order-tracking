@@ -136,3 +136,8 @@ def list_shipments(phone: str | None = None) -> list[dict]:
         if phone:
             query = query.where(ShipmentRecord.user_phone == phone)
         return [_as_dict(row) for row in db.scalars(query).all()]
+
+
+def list_customer_phones() -> list[str]:
+    with SessionLocal() as db:
+        return list(db.scalars(select(ShipmentRecord.user_phone).distinct()).all())

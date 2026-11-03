@@ -12,6 +12,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 from twilio.request_validator import RequestValidator
 
 from .config import get_settings
+from .customer_access import customer_dashboard_url, phone_from_customer_token
 from .database import attach_aftership, database_ready, init_db, list_shipments, save_shipment, update_status
 from .integrations import register_tracking, send_whatsapp, valid_aftership_signature
 from .parser import parse_message
@@ -143,7 +144,11 @@ async def whatsapp_webhook(request: Request):
         shipment_id = save_shipment(user_phone, info.tracking_number, carrier, label)
         aftership_id, status = await register_tracking(info, user_phone)
         attach_aftership(shipment_id, aftership_id, status)
-        return twiml(f"Got it! I'm tracking {label} with {carrier}: {info.tracking_number}.")
+        dashboard_url = customer_dashboard_url(user_phone)
+        return twiml(
+            f"Got it! I'm tracking {label} with {carrier}: {info.tracking_number}. "
+            f"Your private dashboard: {dashboard_url}"
+        )
     except Exception:
         logger.exception("Failed to process WhatsApp webhook")
         return twiml("I couldn't process that shipment right now. Please try again shortly.")
@@ -177,6 +182,28 @@ def shipments(phone: str | None = None):
     for row in rows:
         row["tracking_url"] = carrier_tracking_url(row["carrier"], row["tracking_number"])
     return {"shipments": rows}
+
+
+@app.get("/api/customer/{token}/shipments")
+def customer_shipments(token: str):
+    phone = phone_from_customer_token(token)
+    if not phone:
+        raise HTTPException(status_code=404, detail="Customer dashboard not found")
+    rows = list_shipments(phone)
+    for row in rows:
+        row.pop("user_phone", None)
+        row["tracking_url"] = carrier_tracking_url(row["carrier"], row["tracking_number"])
+    return {"shipments": rows}
+
+
+@app.get("/customer/{token}", response_class=HTMLResponse)
+def customer_dashboard(token: str):
+    if not phone_from_customer_token(token):
+        raise HTTPException(status_code=404, detail="Customer dashboard not found")
+    return HTMLResponse(f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>
+<title>My Package Tracker</title><style>body{{font:15px system-ui;margin:0;background:#f5f6fa;color:#172033}}main{{max-width:900px;margin:48px auto;padding:0 20px}}h1{{font-size:32px}}.card{{background:white;border-radius:16px;box-shadow:0 8px 30px #17203312;overflow:hidden}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:15px;border-bottom:1px solid #edf0f5}}th{{background:#fafbfc;color:#687386}}.status{{display:inline-block;padding:5px 9px;border-radius:99px;background:#e8f1ff;color:#1262c5}}@media(max-width:650px){{th,td{{padding:11px 8px}}}}</style></head>
+<body><main><h1>My deliveries</h1><p>This private page only shows packages sent from your WhatsApp number.</p><div class='card'><table><thead><tr><th>Item</th><th>Carrier</th><th>Tracking</th><th>Status</th></tr></thead><tbody id='rows'></tbody></table></div></main>
+<script>const e=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));const tracking=x=>x.tracking_url?`<a href="${{e(x.tracking_url)}}" target="_blank" rel="noopener noreferrer">${{e(x.tracking_number)}} ↗</a>`:e(x.tracking_number);async function load(){{const d=await fetch('/api/customer/{token}/shipments').then(r=>r.json());document.querySelector('#rows').innerHTML=d.shipments.map(x=>`<tr><td>${{e(x.item_label)}}</td><td>${{e(x.carrier)}}</td><td>${{tracking(x)}}</td><td><span class=status>${{e(x.status)}}</span></td></tr>`).join('')||'<tr><td colspan=4>No deliveries yet.</td></tr>'}}load();setInterval(load,15000)</script></body></html>""")
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_dashboard_auth)])
