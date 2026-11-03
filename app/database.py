@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import hmac
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine, select, text
@@ -30,6 +31,15 @@ class ProcessedMessage(Base):
     __tablename__ = "processed_messages"
     message_sid: Mapped[str] = mapped_column(String(128), primary_key=True)
     processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class LoginCode(Base):
+    __tablename__ = "login_codes"
+    phone: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 def _database_url() -> str:
@@ -141,3 +151,40 @@ def list_shipments(phone: str | None = None) -> list[dict]:
 def list_customer_phones() -> list[str]:
     with SessionLocal() as db:
         return list(db.scalars(select(ShipmentRecord.user_phone).distinct()).all())
+
+
+def save_login_code(phone: str, hashed_code: str) -> bool:
+    now = datetime.now(timezone.utc)
+    with SessionLocal.begin() as db:
+        recent = db.scalar(select(LoginCode).where(
+            LoginCode.phone == phone,
+            LoginCode.created_at > now - timedelta(seconds=60),
+        ))
+        if recent:
+            return False
+        record = db.get(LoginCode, phone)
+        if record is None:
+            record = LoginCode(phone=phone, code_hash=hashed_code, expires_at=now + timedelta(minutes=10))
+            db.add(record)
+        else:
+            record.code_hash = hashed_code
+            record.attempts = 0
+            record.created_at = now
+            record.expires_at = now + timedelta(minutes=10)
+        return True
+
+
+def consume_login_code(phone: str, hashed_code: str) -> bool:
+    now = datetime.now(timezone.utc)
+    with SessionLocal.begin() as db:
+        record = db.get(LoginCode, phone)
+        expires_at = record.expires_at.replace(tzinfo=timezone.utc) if record and not record.expires_at.tzinfo else (record.expires_at if record else now)
+        if not record or expires_at < now or record.attempts >= 5:
+            if record:
+                db.delete(record)
+            return False
+        record.attempts += 1
+        if not hmac.compare_digest(record.code_hash, hashed_code):
+            return False
+        db.delete(record)
+        return True

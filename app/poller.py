@@ -4,7 +4,6 @@ import logging
 import httpx
 
 from .config import get_settings
-from .customer_access import customer_dashboard_url
 from .database import attach_aftership, mark_message_processed, message_processed, save_shipment
 from .integrations import register_tracking, send_whatsapp
 from .parser import parse_message
@@ -57,7 +56,7 @@ async def process_twilio_message(message: dict, client: httpx.AsyncClient) -> No
             await send_whatsapp(
                 sender,
                 f"Got it! I'm tracking {label} with {carrier}: {info.tracking_number}. "
-                f"Your private dashboard: {customer_dashboard_url(sender)}",
+                f"Open Package Tracker: {get_settings().public_base_url.rstrip('/')}/app",
             )
     except Exception:
         logger.exception("Failed to process Twilio message %s", sid)

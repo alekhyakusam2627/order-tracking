@@ -7,13 +7,16 @@ from html import escape
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from twilio.request_validator import RequestValidator
 
 from .config import get_settings
-from .customer_access import customer_dashboard_url, phone_from_customer_token
-from .database import attach_aftership, database_ready, init_db, list_shipments, save_shipment, update_status
+from .customer_auth import code_hash, new_login_code, normalize_whatsapp_phone, phone_from_session, session_token
+from .customer_access import phone_from_customer_token
+from .customer_pages import APP_PAGE, LOGIN_PAGE
+from .database import attach_aftership, consume_login_code, database_ready, init_db, list_shipments, save_login_code, save_shipment, update_status
 from .integrations import register_tracking, send_whatsapp, valid_aftership_signature
 from .parser import parse_message
 from .poller import poll_twilio_messages
@@ -21,6 +24,7 @@ from .tracking_urls import carrier_tracking_url
 
 
 settings = get_settings()
+SESSION_COOKIE = "customer_session"
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -93,6 +97,14 @@ def twiml(message: str) -> Response:
     return Response(body, media_type="application/xml")
 
 
+class PhoneRequest(BaseModel):
+    phone: str
+
+
+class CodeRequest(PhoneRequest):
+    code: str
+
+
 async def validate_twilio(request: Request, form: dict) -> None:
     settings = get_settings()
     signature = request.headers.get("x-twilio-signature")
@@ -144,10 +156,10 @@ async def whatsapp_webhook(request: Request):
         shipment_id = save_shipment(user_phone, info.tracking_number, carrier, label)
         aftership_id, status = await register_tracking(info, user_phone)
         attach_aftership(shipment_id, aftership_id, status)
-        dashboard_url = customer_dashboard_url(user_phone)
+        app_url = f"{settings.public_base_url.rstrip('/')}/app"
         return twiml(
             f"Got it! I'm tracking {label} with {carrier}: {info.tracking_number}. "
-            f"Your private dashboard: {dashboard_url}"
+            f"Open Package Tracker: {app_url}"
         )
     except Exception:
         logger.exception("Failed to process WhatsApp webhook")
@@ -194,6 +206,98 @@ def customer_shipments(token: str):
         row.pop("user_phone", None)
         row["tracking_url"] = carrier_tracking_url(row["carrier"], row["tracking_number"])
     return {"shipments": rows}
+
+
+@app.post("/api/auth/request-code")
+async def request_login_code(payload: PhoneRequest):
+    phone = normalize_whatsapp_phone(payload.phone)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Enter a valid number with country code")
+    code = new_login_code()
+    if not save_login_code(phone, code_hash(phone, code)):
+        raise HTTPException(status_code=429, detail="Please wait one minute before requesting another code")
+    try:
+        await send_whatsapp(phone, f"Your Package Tracker login code is {code}. It expires in 10 minutes.")
+    except Exception:
+        logger.exception("Failed to send customer login code")
+        raise HTTPException(status_code=502, detail="Could not send the WhatsApp code")
+    return {"sent": True}
+
+
+@app.post("/api/auth/verify-code")
+def verify_login_code(payload: CodeRequest):
+    phone = normalize_whatsapp_phone(payload.phone)
+    if not phone or not payload.code.isdigit() or len(payload.code) != 6:
+        raise HTTPException(status_code=400, detail="Enter the six-digit code")
+    if not consume_login_code(phone, code_hash(phone, payload.code)):
+        raise HTTPException(status_code=401, detail="The code is invalid or expired")
+    response = JSONResponse({"authenticated": True})
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_token(phone),
+        max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        secure=settings.public_base_url.startswith("https://"),
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout():
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/me/shipments")
+def my_shipments(request: Request):
+    phone = phone_from_session(request.cookies.get(SESSION_COOKIE))
+    if not phone:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    rows = list_shipments(phone)
+    for row in rows:
+        row.pop("user_phone", None)
+        row["tracking_url"] = carrier_tracking_url(row["carrier"], row["tracking_number"])
+    return {"shipments": rows}
+
+
+@app.get("/login", response_class=HTMLResponse)
+def customer_login(request: Request):
+    if phone_from_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse("/app", status_code=303)
+    return HTMLResponse(LOGIN_PAGE)
+
+
+@app.get("/app", response_class=HTMLResponse)
+def customer_app(request: Request):
+    if not phone_from_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(APP_PAGE)
+
+
+@app.get("/manifest.webmanifest")
+def web_manifest():
+    return JSONResponse({
+        "name": "Package Tracker",
+        "short_name": "Tracker",
+        "start_url": "/app",
+        "display": "standalone",
+        "background_color": "#f5f6fa",
+        "theme_color": "#1262c5",
+        "icons": [{"src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml"}],
+    }, media_type="application/manifest+json")
+
+
+@app.get("/service-worker.js")
+def service_worker():
+    return Response("self.addEventListener('fetch',()=>{});", media_type="application/javascript")
+
+
+@app.get("/app-icon.svg")
+def app_icon():
+    return Response("""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='96' fill='#1262c5'/><path d='M104 158l152-76 152 76v196l-152 76-152-76z' fill='white'/><path d='M104 158l152 78 152-78M256 236v194' fill='none' stroke='#1262c5' stroke-width='24'/></svg>""", media_type="image/svg+xml")
 
 
 @app.get("/customer/{token}", response_class=HTMLResponse)
