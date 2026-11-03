@@ -7,3 +7,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .DS_Store
+android/android.keystore
+android/*.aab
+android/*.apk
+android/*.idsig
+android/.gradle/
+android/build/
+android/app/build/

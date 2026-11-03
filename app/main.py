@@ -300,6 +300,20 @@ def app_icon():
     return Response("""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='96' fill='#1262c5'/><path d='M104 158l152-76 152 76v196l-152 76-152-76z' fill='white'/><path d='M104 158l152 78 152-78M256 236v194' fill='none' stroke='#1262c5' stroke-width='24'/></svg>""", media_type="image/svg+xml")
 
 
+@app.get("/.well-known/assetlinks.json")
+def android_asset_links():
+    return JSONResponse([{
+        "relation": ["delegate_permission/common.handle_all_urls"],
+        "target": {
+            "namespace": "android_app",
+            "package_name": "com.alekhyakusam.packagetracker",
+            "sha256_cert_fingerprints": [
+                "FA:20:A7:84:C0:AF:71:D7:FD:01:0A:CE:A4:08:06:CE:9A:7C:94:44:BF:24:F5:77:1D:52:FE:DD:48:AB:D1:A6"
+            ],
+        },
+    }])
+
+
 @app.get("/customer/{token}", response_class=HTMLResponse)
 def customer_dashboard(token: str):
     if not phone_from_customer_token(token):
